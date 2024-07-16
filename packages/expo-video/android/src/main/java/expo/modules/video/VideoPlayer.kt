@@ -21,6 +21,7 @@ import androidx.media3.session.MediaSessionService
 import androidx.media3.ui.PlayerView
 import expo.modules.kotlin.AppContext
 import expo.modules.kotlin.sharedobjects.SharedObject
+import expo.modules.video.enums.PlayerEvent
 import expo.modules.video.enums.PlayerStatus
 import expo.modules.video.enums.PlayerStatus.*
 import expo.modules.video.records.PlaybackError
@@ -35,28 +36,31 @@ class VideoPlayer(val context: Context, appContext: AppContext, source: VideoSou
   // This improves the performance of playing DRM-protected content
   private var renderersFactory = DefaultRenderersFactory(context)
     .forceEnableMediaCodecAsynchronousQueueing()
-  val audioFocusManager = VideoPlayerAudioFocusManager(context, WeakReference(this))
   val player = ExoPlayer
     .Builder(context, renderersFactory)
     .setLooper(context.mainLooper)
     .build()
 
-  // We duplicate some properties of the player, because we don't want to always use the mainQueue to access them.
+  var listeners: MutableList<WeakReference<VideoPlayerListener>> = mutableListOf()
+
+  // We duplicate some properties of the player, because we don't want to always use the mainQueue to read them.
   var playing = false
     set(value) {
-      if (field != value) {
-        emit("playingChange", value, field)
-      }
+      val oldValue = field
       field = value
+      if (oldValue != value) {
+        sendEvent(PlayerEvent.PLAYING_CHANGE, value, oldValue)
+      }
     }
 
   var uncommittedSource: VideoSource? = source
   private var lastLoadedSource: VideoSource? = null
     set(value) {
-      if (field != value && value != null) {
-        emit("sourceChange", value, field)
-      }
+      val oldValue = field
       field = value
+      if (oldValue != value) {
+        sendEvent(PlayerEvent.SOURCE_CHANGE, value, oldValue)
+      }
     }
 
   // Volume of the player if there was no mute applied.
@@ -85,36 +89,38 @@ class VideoPlayer(val context: Context, appContext: AppContext, source: VideoSou
     set(volume) {
       if (player.volume == volume) return
       player.volume = if (muted) 0f else volume
-      emit("volumeChange", VolumeEvent(volume, muted), VolumeEvent(field, muted))
+      val oldValue = field
       field = volume
+      sendEvent(PlayerEvent.VOLUME_CHANGE, VolumeEvent(volume, muted), VolumeEvent(oldValue, muted))
     }
 
   var muted = false
     set(muted) {
       if (field == muted) return
-      emit("volumeChange", VolumeEvent(volume, muted), VolumeEvent(volume, field))
       player.volume = if (muted) 0f else userVolume
+      val oldValue = field
       field = muted
-      audioFocusManager.onPlayerChangedAudioFocusProperty(this@VideoPlayer)
+      sendEvent(PlayerEvent.VOLUME_CHANGE, VolumeEvent(volume, muted), VolumeEvent(volume, oldValue))
     }
 
   var playbackParameters: PlaybackParameters = PlaybackParameters.DEFAULT
     set(newPlaybackParameters) {
-      if (playbackParameters.speed != newPlaybackParameters.speed) {
-        emit("playbackRateChange", newPlaybackParameters.speed, playbackParameters.speed)
-      }
+      val oldPlaybackParameters = field
       val pitchCorrectedPlaybackParameters = applyPitchCorrection(newPlaybackParameters)
       field = pitchCorrectedPlaybackParameters
 
       if (player.playbackParameters != pitchCorrectedPlaybackParameters) {
         player.playbackParameters = pitchCorrectedPlaybackParameters
       }
+
+      if (oldPlaybackParameters.speed != newPlaybackParameters.speed) {
+        sendEvent(PlayerEvent.PLAYBACK_RATE_CHANGE, newPlaybackParameters.speed, oldPlaybackParameters.speed)
+      }
     }
 
   private val playerListener = object : Player.Listener {
     override fun onIsPlayingChanged(isPlaying: Boolean) {
       this@VideoPlayer.playing = isPlaying
-      audioFocusManager.onPlayerChangedAudioFocusProperty(this@VideoPlayer)
     }
 
     override fun onTimelineChanged(timeline: Timeline, reason: Int) {
@@ -125,7 +131,7 @@ class VideoPlayer(val context: Context, appContext: AppContext, source: VideoSou
       this@VideoPlayer.duration = 0f
       this@VideoPlayer.isLive = false
       if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT) {
-        emit("playToEnd")
+        sendEvent(PlayerEvent.PLAY_TO_END)
       }
       super.onMediaItemTransition(mediaItem, reason)
     }
@@ -144,7 +150,6 @@ class VideoPlayer(val context: Context, appContext: AppContext, source: VideoSou
 
     override fun onVolumeChanged(volume: Float) {
       this@VideoPlayer.volume = volume
-      audioFocusManager.onPlayerChangedAudioFocusProperty(this@VideoPlayer)
     }
 
     override fun onPlaybackParametersChanged(playbackParameters: PlaybackParameters) {
@@ -154,9 +159,9 @@ class VideoPlayer(val context: Context, appContext: AppContext, source: VideoSou
 
     override fun onPlayerErrorChanged(error: PlaybackException?) {
       error?.let {
-        setStatus(ERROR, error)
         this@VideoPlayer.duration = 0f
         this@VideoPlayer.isLive = false
+        setStatus(ERROR, error)
       } ?: run {
         setStatus(playerStateToPlayerStatus(player.playbackState), null)
       }
@@ -210,7 +215,6 @@ class VideoPlayer(val context: Context, appContext: AppContext, source: VideoSou
   }
 
   override fun close() {
-    audioFocusManager.onPlayerDestroyed()
     appContext?.reactContext?.unbindService(serviceConnection)
     playbackServiceBinder?.service?.unregisterPlayer(player)
     VideoManager.unregisterVideoPlayer(this@VideoPlayer)
@@ -270,18 +274,96 @@ class VideoPlayer(val context: Context, appContext: AppContext, source: VideoSou
       else -> IDLE
     }
   }
+
   private fun setStatus(status: PlayerStatus, error: PlaybackException?) {
+    val oldStatus = this.status
+    this.status = status
+
     val playbackError = error?.let {
       PlaybackError(it)
     }
 
     if (playbackError == null && player.playbackState == Player.STATE_ENDED) {
-      emit("playToEnd")
+      sendEvent(PlayerEvent.PLAY_TO_END)
     }
 
     if (this.status != status) {
-      emit("statusChange", status.value, this.status.value, playbackError)
+      sendEvent(PlayerEvent.STATUS_CHANGE, status.value, oldStatus.value, playbackError)
     }
-    this.status = status
+  }
+
+  fun addListener(videoPlayerListener: VideoPlayerListener) {
+    listeners.find { it.get() == videoPlayerListener } ?: run {
+      listeners.add(WeakReference(videoPlayerListener))
+    }
+  }
+
+  fun removeListener(videoPlayerListener: VideoPlayerListener) {
+    listeners.removeAll { it.get() == videoPlayerListener }
+  }
+
+  private fun sendEvent(event: PlayerEvent, vararg args: Any?) {
+    // Send the event to the JS
+    emit(event.value, *args)
+
+    // Send the event to native listeners
+    when (event) {
+      PlayerEvent.PLAYING_CHANGE -> {
+        val isPlaying = args[0] as? Boolean
+        val oldIsPlaying = args[1] as? Boolean
+        isPlaying?.let {
+          listeners.forEach {
+            it.get()?.onIsPlayingChanged(this, isPlaying, oldIsPlaying)
+          }
+        }
+      }
+      PlayerEvent.STATUS_CHANGE -> {
+        val status = args[0] as? PlayerStatus
+        val oldStatus = args[1] as? PlayerStatus
+        val error = args[2] as? PlaybackError
+        status?.let {
+          listeners.forEach {
+            it.get()?.onStatusChanged(this, status, oldStatus, error)
+          }
+        }
+      }
+      PlayerEvent.VOLUME_CHANGE -> {
+        val volumeEvent = args[0] as? VolumeEvent
+        val oldVolumeEvent = args[0] as? VolumeEvent
+
+        volumeEvent?.volume?.let { volume ->
+          listeners.forEach {
+            it.get()?.onVolumeChanged(this, volume, oldVolumeEvent?.volume)
+          }
+        }
+
+        volumeEvent?.isMuted?.let { isMuted ->
+          listeners.forEach {
+            it.get()?.onIsMutedChanged(this, isMuted, oldVolumeEvent?.isMuted)
+          }
+        }
+      }
+      PlayerEvent.SOURCE_CHANGE -> {
+        val source = args[0] as? VideoSource
+        val oldSource = args[1] as? VideoSource
+        listeners.forEach {
+          it.get()?.onSourceChanged(this, source, oldSource)
+        }
+      }
+      PlayerEvent.PLAYBACK_RATE_CHANGE -> {
+        val playbackRate = args[0] as? Float
+        val oldPlaybackRate = args[1] as? Float
+        playbackRate?.let {
+          listeners.forEach {
+            it.get()?.onPlaybackRateChanged(this, playbackRate, oldPlaybackRate)
+          }
+        }
+      }
+      PlayerEvent.PLAY_TO_END -> {
+        listeners.forEach {
+          it.get()?.onPlayedToEnd(this)
+        }
+      }
+    }
   }
 }

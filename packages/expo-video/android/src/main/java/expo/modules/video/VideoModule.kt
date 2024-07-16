@@ -3,7 +3,6 @@
 package expo.modules.video
 
 import android.app.Activity
-import android.content.Context
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player.REPEAT_MODE_OFF
 import androidx.media3.common.Player.REPEAT_MODE_ONE
@@ -25,11 +24,13 @@ import kotlinx.coroutines.runBlocking
 class VideoModule : Module() {
   private val activity: Activity
     get() = appContext.activityProvider?.currentActivity ?: throw Exceptions.MissingActivity()
-  private val reactContext: Context
-    get() = appContext.reactContext ?: throw Exceptions.ReactContextLost()
 
   override fun definition() = ModuleDefinition {
     Name("ExpoVideo")
+
+    OnCreate {
+      VideoManager.onModuleCreated(appContext)
+    }
 
     Function("isPictureInPictureSupported") {
       return@Function VideoView.isPictureInPictureSupported(activity)
